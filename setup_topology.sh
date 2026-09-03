@@ -52,3 +52,8 @@ echo "Topology ready. Verify with:"
 echo "  sudo ip netns exec client ping -c2 10.0.0.2"
 echo "  sudo ip netns exec client ping -c2 10.0.0.3"
 echo "  sudo ip netns exec client ip route"
+
+#crlf fixed
+#sed -i 's/\r$//' setup_topology.sh
+# chmod +x setup_topology.sh
+# sudo ./setup_topology.sh
