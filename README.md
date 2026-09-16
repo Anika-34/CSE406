@@ -33,6 +33,8 @@ The attacker sends a spoofed **ICMP Type 3, Code 4** (Fragmentation Needed, DF S
 The lab uses three Linux network namespaces connected via a software bridge, all running inside a single Ubuntu 22.04 virtual machine.
 
 
+
+
 ### 2.2 Components
 
 | Node     | IP Address | Namespace | Role                                              |
