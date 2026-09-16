@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Sniffing {args.iface} for {SERVER_IP}:{args.server_port} -> {CLIENT_IP} traffic...")
-    client_port, seq = capture_live_state(
+    _, client_port, seq = capture_live_state(
         args.iface, SERVER_IP, args.server_port, CLIENT_IP, args.count, args.timeout
     )
     print(f"Captured: client_port={client_port} server_seq={seq}")

