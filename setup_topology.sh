@@ -13,6 +13,12 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# veth pairs have no physical link, so an unshaped client<->server path runs
+# at tens of Gbps (memory-copy speed) inside the VM. That's unrealistic for a
+# TCP experiment and generates unmanageably large pcaps, so cap it to a LAN-
+# like rate. Override with: LINK_RATE=10mbit sudo ./setup_topology.sh
+LINK_RATE="${LINK_RATE:-100mbit}"
+
 # --- Teardown (idempotent re-run) ---
 ip netns del client   2>/dev/null || true
 ip netns del server   2>/dev/null || true
@@ -41,6 +47,10 @@ create_node() {
 create_node client   veth-cl veth-cl-br 10.0.0.1
 create_node server   veth-sv veth-sv-br 10.0.0.2
 create_node attacker veth-at veth-at-br 10.0.0.3
+
+# --- Rate-limit the client/server link to something LAN-realistic ---
+ip netns exec client tc qdisc add dev veth-cl root tbf rate "$LINK_RATE" burst 32kbit latency 400ms
+ip netns exec server tc qdisc add dev veth-sv root tbf rate "$LINK_RATE" burst 32kbit latency 400ms
 
 # --- rp_filter: disable source-address validation (allows IP spoofing in lab) ---
 for NS in client server attacker; do
