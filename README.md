@@ -1,6 +1,6 @@
 # ICMP Blind Connection-Reset & Blind Throughput Reduction Attack Against TCP
-**CSE 406 — Computer Security Sessional | Topic No. 12**
-Anika Morshed (2105068) · Diganta Saha Tirtha (2105081) · Section B1 · September 12, 2026
+**CSE 406 — Computer Security Sessional**
+Anika Morshed (2105068) · Diganta Saha Tirtha (2105081)
 
 ---
 
