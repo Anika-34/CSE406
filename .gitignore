@@ -1,5 +1,5 @@
 # VM_COMMANDS.md
-*.md
+# *.md
 
 # Regenerable experiment output (pcaps, iperf3 json) — rerun the scripts to reproduce
 experiments/results/
