@@ -74,7 +74,13 @@ def capture_live_state(iface, from_ip, from_port, to_ip, count, timeout):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         stdout = result.stdout
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
+        # subprocess.run(text=True) only decodes output on the normal
+        # completion path; on a timeout, TimeoutExpired.stdout/.stderr
+        # carry raw bytes regardless (a documented subprocess quirk), so
+        # decode it ourselves before it hits the str-only regex below.
+        stdout = exc.stdout or b""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
 
     # Matches lines like:
     #   ... IP 10.0.0.2.9999 > 10.0.0.1.45526: Flags [S.], seq 1829896795, ...
