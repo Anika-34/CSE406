@@ -1,0 +1,545 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{caption}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Final Report}
+\fancyhead[R]{CSE406 Security Sessional}
+\fancyfoot[C]{\thepage}
+
+\newcommand{\worked}{\textcolor{green!50!black}{\textbf{As expected}}}
+\newcommand{\failed}{\textcolor{red!70!black}{\textbf{Differed from expectation}}}
+\newcommand{\partialres}{\textcolor{orange!80!black}{\textbf{Partially / conditionally}}}
+\newcommand{\open}{\textcolor{gray}{\textbf{Unresolved / under investigation}}}
+
+\title{
+    \textbf{ICMP Blind Connection-Reset \& Blind Throughput Reduction\\
+    Attack Against TCP} \\
+    \vspace{0.3cm}
+    \large Final Implementation \& Evaluation Report \\
+    \vspace{0.2cm}
+    \large CSE 406 --- Computer Security Sessional
+}
+\author{
+    Anika Morshed (2105068) \\
+    Diganta Saha Tirtha (2105081) \\
+    Section: B1
+}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report documents the implementation and empirical evaluation of two
+ICMP-based blind injection attacks against TCP --- a connection-reset
+attack (Type 3, Code 3) and a Path-MTU throughput-reduction attack
+(Type 3, Code 4) --- together with two candidate defenses against them.
+For each attack and each defense we record the process used, the outcome
+expected from the original design (based on RFC~792, RFC~1122 and
+RFC~1191), the outcome actually observed in a live network-namespace
+lab, an analysis of any discrepancy between the two, and the assumptions
+the attack or defense implicitly depends on. Several outcomes differed
+materially from the initial design assumptions; these differences, and
+their causes, are the primary findings of this report.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+Both attacks exploit the same structural property of ICMP error
+handling: an ICMP error message embeds a copy of the original packet's
+IP and TCP headers (RFC~792) so the receiving host can match the error
+to one of its own connections. Because this embedded header is
+attacker-controlled once source-address spoofing is possible, a forged
+ICMP message that mimics a real connection's headers can influence a TCP
+stack's behavior without the attacker ever being on-path for that
+connection.
+
+\begin{itemize}
+    \item \textbf{Attack 1} spoofs \textbf{ICMP Type 3, Code 3} (Port
+    Unreachable) to trigger an RFC~1122 \emph{hard error}, which a
+    vulnerable stack uses to abort an established connection immediately.
+    \item \textbf{Attack 2} spoofs \textbf{ICMP Type 3, Code 4}
+    (Fragmentation Needed, DF Set) with a small advertised Next-Hop MTU,
+    to shrink a bulk sender's Path MTU (and therefore its MSS) and
+    degrade throughput.
+\end{itemize}
+
+Both were implemented and tested in a controlled lab of three Linux
+network namespaces (\texttt{client} 10.0.0.1, \texttt{server} 10.0.0.2,
+\texttt{attacker} 10.0.0.3) joined by a software bridge, as specified in
+the design report and built by \texttt{setup\_topology.sh}.
+
+\section{Attack 1: ICMP Blind Connection-Reset}
+
+\subsection{Attack Process}
+
+\begin{enumerate}
+    \item A client and server hold an ordinary, idle TCP connection open
+    (via \texttt{ncat}).
+    \item The attacker passively sniffs the bridge (via traffic
+    mirroring configured in \texttt{setup\_topology.sh}) to observe the
+    server's own outgoing segment and recover the client's ephemeral
+    port and a sequence number known to be inside the server's current
+    send window (\texttt{attacks/build\_packets.py::capture\_live\_state()}).
+    \item The attacker crafts a spoofed ICMP Type 3/Code 3 packet
+    (\texttt{attacks/build\_packets.py::build\_reset\_packet()}) and
+    injects it with Scapy's \texttt{send()}
+    (\texttt{attacks/inject\_reset.py}).
+    \item The server's kernel receives the ICMP, matches it against the
+    live socket via the embedded header, and --- if it treats the error
+    as fatal --- aborts the connection.
+\end{enumerate}
+
+\paragraph{Packet structure used (corrected).} The design report's
+original field table specified the embedded header as
+\texttt{src=Client, dst=Server}. Empirically, this direction never
+matched any socket on the server, because ICMP errors are delivered to
+the \emph{original sender} of the embedded packet -- the server has no
+socket where it is the destination of its own traffic. The corrected,
+working structure is:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Layer} & \textbf{Field} & \textbf{Value} \\
+\midrule
+Outer IP & Source & 10.0.0.2 (spoofed -- impersonates the server) \\
+Outer IP & Destination & 10.0.0.2 (the real server; the target) \\
+ICMP & Type / Code & 3 / 3 (Port Unreachable) \\
+Embedded IP & Source $\to$ Destination & 10.0.0.2 $\to$ 10.0.0.1 (server $\to$ client) \\
+Embedded TCP & Source port $\to$ Dest.\ port & server's port $\to$ client's ephemeral port \\
+Embedded TCP & Sequence number & sniffed from the server's own live outgoing segment \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Expected Outcome}
+
+Per the design report (Section 5.1), a successful attack should produce:
+\begin{enumerate}
+    \item The spoofed ICMP visible in the server's own \texttt{tcpdump} capture.
+    \item The embedded sequence number falling inside the server's receive window.
+    \item The server's TCP stack aborting the connection (RFC~1122 hard-error behavior).
+    \item \texttt{ss -tn} on the server showing the socket gone.
+    \item The client-side \texttt{ncat} process reporting a broken pipe / reset.
+\end{enumerate}
+
+\subsection{Actual Outcome}
+
+Items 1 and 2 were confirmed on every run: the spoofed packet reliably
+arrives and reliably passes the in-window check. \textbf{Items 3--5 did
+not occur against a realistic target.} Against a connection held with
+plain \texttt{ncat}, the same, correctly-formed packet was delivered but
+the connection \textbf{survived} -- it remained \texttt{ESTAB} in
+\texttt{ss -tn} with no observable effect.
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Scenario} & \textbf{ICMP delivered / in-window?} & \textbf{Result} \\
+\midrule
+Plain \texttt{ncat} (realistic target) & Yes & \textbf{Survived} (still \texttt{ESTAB}) \\
+\texttt{recverr\_server.py} (\texttt{IP\_RECVERR} set) & Yes & \textbf{Reset} (socket left \texttt{ESTAB}, typically \texttt{FIN-WAIT-2}) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+To rule out a defect in the injected packet itself, a second target,
+\texttt{experiments/recverr\_server.py}, was built: an otherwise-identical
+TCP server that explicitly sets the \texttt{IP\_RECVERR} socket option.
+Against this target the identical attack \textbf{did} reliably reset the
+connection (\texttt{ConnectionRefusedError} raised on the server, socket
+observed leaving \texttt{ESTAB}), confirming the packet's direction,
+sequence number, and checksums were all correctly formed.
+
+\subsection{Discrepancy Analysis: Why the Outcome Differed}
+
+Reading the Linux kernel source (\texttt{tcp\_v4\_err()} in
+\texttt{net/ipv4/tcp\_ipv4.c}) explains the discrepancy. For a socket
+that is already in the \texttt{ESTABLISHED} state, Linux only treats
+this ICMP as an immediately-fatal RFC~1122 hard error if the owning
+application has explicitly opted in via the \texttt{IP\_RECVERR} socket
+option; otherwise the kernel silently downgrades it to a non-fatal
+\texttt{sk\_err\_soft} and the connection is left untouched. Ordinary
+tools such as \texttt{ncat} do not set this option, so they are immune
+to this attack in its simplest form, while an application that does set
+it (a legitimate, documented use case for applications that want richer
+error reporting) remains vulnerable exactly as the design predicted.
+
+This is a real, previously undocumented (in the design report) kernel
+defense, additional to the two the design report already lists in
+Section 6, and is reported as such in Section~5 of this report.
+
+\subsection{Assumptions}
+
+\begin{itemize}
+    \item The attacker can observe the live connection's traffic (via
+    mirroring in this lab; in a real network, via some other on-path
+    vantage point, a shared broadcast segment, or coarse
+    inference/guessing of the sequence number).
+    \item Ingress/egress source-address filtering is \emph{not} enforced
+    anywhere between the attacker and the target (\texttt{rp\_filter} is
+    explicitly disabled in the lab to permit this).
+    \item The targeted application either does not rely on the specific
+    \texttt{IP\_RECVERR} behavior described above, or the report
+    explicitly evaluates the case where it does (the positive control).
+    \item The embedded sequence number remains inside the receiver's
+    current window at the moment the forged packet is processed --
+    trivially true here because the target connection is deliberately
+    idle, so the window never moves.
+\end{itemize}
+
+\section{Attack 2: ICMP Blind PMTU Throughput Reduction}
+
+\subsection{Attack Process}
+
+\begin{enumerate}
+    \item A client sends a sustained bulk transfer to the server via
+    \texttt{iperf3}.
+    \item The attacker sniffs the client's own outgoing segments to
+    recover a live sequence number
+    (\texttt{attacks/build\_packets.py::capture\_live\_state()}).
+    \item The attacker crafts a spoofed ICMP Type 3/Code 4 packet with a
+    small advertised Next-Hop MTU (576 bytes) and \emph{sprays} 300
+    candidate packets, spaced 50{,}000 bytes apart in sequence space
+    (\texttt{attacks/inject\_pmtu.py}), repeating this every few seconds
+    for the duration of the attack.
+    \item The client's kernel accepts the ICMP, updates its Path-MTU
+    cache for the server, and shrinks its MSS accordingly.
+\end{enumerate}
+
+\paragraph{Packet structure used.} Unlike Attack 1, the design report's
+direction for this attack was already correct, because the client is
+both the connection's sender \emph{and} the intended target (MSS is a
+per-sender cache):
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Layer} & \textbf{Field} & \textbf{Value} \\
+\midrule
+Outer IP & Source & 10.0.0.1 (spoofed) \\
+Outer IP & Destination & 10.0.0.1 (the real client; the target, as sender) \\
+ICMP & Type / Code / Next-Hop MTU & 3 / 4 / 576 \\
+Embedded IP & Source $\to$ Destination & 10.0.0.1 $\to$ 10.0.0.2 (client $\to$ server) \\
+Embedded TCP & Source port $\to$ Dest.\ port & client's ephemeral port $\to$ 5201 \\
+Embedded TCP & Sequence number & sniffed from the client's own live outgoing traffic \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Expected Outcome}
+
+Per the design report (Section 5.2):
+\begin{enumerate}
+    \item The spoofed ICMP visible in the client's capture.
+    \item \texttt{ip route get} showing \texttt{mtu 576} (PMTU cache updated).
+    \item TCP segment sizes dropping from $\sim$1460 bytes to $\le 576 - 40 = 536$ bytes.
+    \item A measurable decrease in \texttt{iperf3} throughput.
+\end{enumerate}
+
+\subsection{Actual Outcome}
+
+All four criteria were confirmed, across multiple independent runs.
+Representative measured values:
+
+\begin{center}
+\begin{longtable}{@{}lll@{}}
+\toprule
+\textbf{Metric} & \textbf{Before injection} & \textbf{After injection} \\
+\midrule
+\endhead
+\texttt{ss -tin} (\texttt{mss}/\texttt{pmtu}) & \texttt{mss:1448 pmtu:1500} & \texttt{mss:524 pmtu:576} \\
+\texttt{ip route get 10.0.0.2} & no cached MTU & \texttt{cache expires <N>sec mtu 576} \\
+Avg.\ TCP segment size & 1448 bytes & 531--542 bytes \\
+\texttt{iperf3} throughput (run A) & 95.21 Mbps & 89.03 Mbps ($-6.5\%$) \\
+\texttt{iperf3} throughput (run B) & 92.83 Mbps & 87.57 Mbps ($-5.7\%$) \\
+ICMP packets observed & --- & exactly (spray rounds $\times$ 300) \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+The ICMP-packet count matching \emph{exactly} (spray rounds $\times$
+300) across every run is an internal consistency check confirming every
+sprayed candidate was actually delivered, not merely that some
+non-deterministic subset landed.
+
+\subsection{Discrepancy Analysis: Why the Outcome Differed (Partially)}
+
+The four qualitative criteria all held, but two aspects needed
+correction from a naive first implementation, both already anticipated
+in the design report's phrasing but underestimated in magnitude:
+
+\begin{itemize}
+    \item \textbf{A single sequence-number guess reliably fails.}
+    Unlike Attack 1's idle target, this connection is an active bulk
+    transfer, so the kernel's in-window check
+    (\texttt{between(seq, snd\_una, snd\_nxt)}) -- which applies to
+    \emph{every} ICMP type/code, not only the reset case -- must be
+    satisfied against a window that is only \texttt{cwnd*mss} wide
+    (measured at $\sim$100--150\,KB) and sliding forward at the full
+    transfer rate. By the time one sniffed value passes through
+    \texttt{tcpdump}, Python, and Scapy's \texttt{send()}, it is almost
+    always already acknowledged and out of window (confirmed via the
+    \texttt{TcpExt:OutOfWindowIcmps} counter in \texttt{/proc/net/netstat}).
+    Spraying 300 candidates across $\sim$15\,MB of sequence space, in
+    steps smaller than the in-flight window, is what reliably lands at
+    least one packet inside the live window. This matches the design
+    report's own (plural) wording, ``sampled seq numbers,'' and the
+    technique used in Watson's original blind TCP injection research.
+    \item \textbf{The throughput drop is real but modest ($5$--$7\%$),
+    not dramatic}, because the lab's client--server link is
+    byte-rate-limited to 100\,Mbit (\texttt{tc tbf}) for realism. At a
+    fixed byte rate, a smaller MSS mainly shifts more of every
+    rate-capped packet toward the fixed 40-byte IP+TCP header instead of
+    payload ($\sim$97\% payload efficiency at MSS 1448 vs.\ $\sim$93\%
+    at MSS 536) -- a real, explainable effect of the lab's shaping
+    choice, not evidence the attack is weak.
+\end{itemize}
+
+\subsection{Assumptions}
+
+\begin{itemize}
+    \item The attacker can observe the live connection's own outgoing
+    traffic to recover a plausible base sequence number.
+    \item No ingress/egress source-address filtering exists between the
+    attacker and the target.
+    \item The attacker can send the spray fast enough, and repeat it
+    often enough, to keep at least one candidate inside the constantly
+    shifting in-window range -- a persistent-attacker assumption,
+    explicitly acknowledged in \S 4 below when discussing why a
+    self-healing defense can be undermined by re-spraying.
+    \item The target's application does not itself detect or route
+    around the reduced MSS in a way that this report has not modeled
+    (e.g.\ redundant multipath).
+\end{itemize}
+
+\section{Defense Mechanisms}
+
+Two defenses named in the design report (Section 6) were implemented
+and evaluated, plus one already-listed defense that was confirmed as an
+emergent property of the attacks themselves rather than a separately
+built mechanism.
+
+\subsection{Sequence-Number Validation (Design Report Defense 1)}
+
+\paragraph{Mechanism.} Modern Linux kernels reject any ICMP error whose
+embedded sequence number falls outside the target connection's current
+window, regardless of whether the source address is genuine.
+
+\paragraph{Expected outcome.} Blind sequence-number guessing becomes
+substantially harder against an active connection.
+
+\paragraph{Actual outcome.} \worked. This defense was not implemented
+separately -- it is already active, by default, in the lab's stock
+Linux kernel, and its effect is precisely what forced Attack 2's design
+away from a single guess toward the 300-candidate spray described in
+Section~3.3. Its presence is confirmed indirectly but unambiguously by
+the \texttt{TcpExt:OutOfWindowIcmps} counter incrementing on single-shot
+attempts.
+
+\subsection{Ingress Filtering / BCP~38 (Design Report Defense 2)}
+
+\paragraph{Mechanism.} A border router or switch port refuses to
+forward any packet whose source address does not belong to the network
+segment it physically arrived from. Simulated in this lab with a
+\texttt{tc} filter on the bridge port the attacker's traffic physically
+arrives on (\texttt{veth-at-br}), permitting only
+\texttt{src=10.0.0.3} (the attacker's genuine address) and dropping
+everything else:
+
+\begin{verbatim}
+tc qdisc add dev veth-at-br handle ffff: ingress
+tc filter add dev veth-at-br parent ffff: protocol ip prio 1 u32 \
+    match ip src 10.0.0.3/32 action ok
+tc filter add dev veth-at-br parent ffff: protocol ip prio 2 u32 \
+    match u32 0 0 action drop
+\end{verbatim}
+
+\paragraph{Expected outcome.} Both attacks should be blocked completely,
+regardless of the target's own TCP-stack-specific behavior, since the
+spoofed packet is stopped before it ever reaches the bridge.
+
+\paragraph{Actual outcome.} \worked. Re-running both attacks with the
+filter active produced no ICMP at either target and no change to
+connection state, MSS, PMTU, segment size, or throughput in either
+attack. Critically, the \texttt{recverr\_server.py} scenario -- which
+\emph{always} resets without this defense -- \textbf{survived} with the
+filter active, isolating that the defense operates at the network layer
+and is independent of the target application's socket options. This
+was the single most conclusive and reliable defense evaluated.
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Scenario (filter active)} & \textbf{ICMP delivered?} & \textbf{Result} \\
+\midrule
+Attack 1, plain \texttt{ncat} & No & Survived (unchanged) \\
+Attack 1, \texttt{recverr\_server.py} & No & \textbf{Survived} (previously reset without the filter) \\
+Attack 2, \texttt{iperf3} bulk transfer & No & \texttt{mss}/\texttt{pmtu} unchanged; throughput unaffected \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{PMTU Cache Aging / PLPMTUD (Design Report's Implementation Plan, P7)}
+
+\paragraph{Mechanism (as specified).} The design report's Implementation
+Plan instructs: ``Enable \texttt{tcp\_mtu\_probing=2}. Repeat P4 and P5.
+Record whether the kernel rejects the forged ICMP messages.'' The
+intent is that Linux's Packetization-Layer PMTU Discovery (PLPMTUD)
+would cause the client to re-verify its true path MTU and recover from
+the forged value on its own.
+
+\paragraph{Expected outcome.} A single spoofed PMTU packet degrades the
+connection's MSS momentarily, then the client's own kernel-level
+recovery restores \texttt{mss}/\texttt{pmtu} to their original values
+within a short window, without any further attacker or network-layer
+intervention.
+
+\paragraph{Actual outcome.} \failed. Two successive, independently
+testable hypotheses about \emph{how} this recovery should occur were
+each implemented and tested, and \textbf{neither produced the expected
+recovery} within the tested window:
+
+\begin{enumerate}
+    \item \textbf{First hypothesis:} \texttt{net.ipv4.tcp\_mtu\_probing=2}
+    together with a shortened \texttt{net.ipv4.tcp\_probe\_interval}
+    (5\,s) would cause active re-probing and recovery. \emph{Result:}
+    \texttt{mss}/\texttt{pmtu} remained pinned at the forged
+    \texttt{524}/\texttt{576} for over 20 continuous seconds. On
+    inspection, \texttt{tcp\_mtu\_probing} governs detection of ICMP
+    \emph{black holes} (a router that silently drops oversized packets
+    and never replies at all) and has no role in re-verifying a PMTU
+    value the kernel already accepted from an ICMP message it did
+    receive.
+    \item \textbf{Second hypothesis:} the route-cache PMTU
+    \emph{exception} created when the ICMP lands (visible as
+    \texttt{cache expires <N>sec mtu 576} in \texttt{ip route get}) ages
+    out via \texttt{net.ipv4.route.mtu\_expires} (600\,s by default);
+    this was shortened to 8\,s to make recovery observable within a
+    reasonable test window. \emph{Result:} even after confirming the
+    exception was created with the shortened timer, \texttt{mss}/\texttt{pmtu}
+    were still pinned at \texttt{524}/\texttt{576} at every checkpoint
+    out to $t{+}40$\,s.
+\end{enumerate}
+
+\paragraph{Status at the time of writing.} This defense is
+\open. A diagnostic step was added (checking whether the route-table
+exception itself has actually been evicted by $t{+}40$\,s, then forcibly
+flushing the route cache to determine whether an already-established,
+continuously busy socket needs an explicit external trigger to
+re-resolve its cached PMTU) but had not yet produced a confirmed root
+cause at submission time. The most plausible working explanation is
+that Linux caches a socket's last-known PMTU
+(\texttt{icsk\_pmtu\_cookie}) and only re-validates it opportunistically
+--- not automatically upon a route-table exception's expiry elsewhere
+--- so a continuously active socket may never receive that trigger on
+its own.
+
+\subsection{Summary: Design-Report Defenses vs.\ Evaluated Reality}
+
+\begin{center}
+\begin{longtable}{@{}p{4.2cm}p{2.6cm}p{7.5cm}@{}}
+\toprule
+\textbf{Defense} & \textbf{Verdict} & \textbf{Notes} \\
+\midrule
+\endhead
+Sequence-number validation & \worked & Inherent to the stock kernel; confirmed indirectly via the need for Attack 2's 300-packet spray. \\
+Ingress filtering (BCP~38) & \worked & Blocks both attacks completely; independent of target application behavior; the single most reliable defense tested. \\
+\texttt{tcp\_mtu\_probing=2} (P7, as literally specified) & \failed & Governs ICMP black-hole detection, not recovery from an \emph{accepted} forged ICMP; produced no observed recovery. \\
+PMTU route-cache aging (follow-up hypothesis, not in the original design report) & \open & Shortened \texttt{mtu\_expires} alone also failed to produce recovery within 40\,s; root cause still being isolated via a route-cache-flush diagnostic. \\
+\texttt{IP\_RECVERR} gating (discovered during Attack 1 testing, not in the original design report) & \worked & Not a designed defense, but a real, already-built-in Linux behavior that defeats Attack 1 against any application that does not explicitly request richer ICMP error delivery. \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\section{Consolidated Assumptions}
+
+The following assumptions are shared across both attacks and are
+necessary preconditions for either to succeed at all:
+
+\begin{enumerate}
+    \item \textbf{No source-address filtering} exists anywhere between
+    the attacker and the target -- disabled explicitly in this lab
+    (\texttt{rp\_filter=0}) to permit spoofing, and shown in
+    Section~4.2 to fully neutralize both attacks when reintroduced.
+    \item \textbf{The attacker can observe enough of the live
+    connection} (source/destination ports and an in-window sequence
+    number) to construct a convincing embedded header -- provided here
+    by passive traffic mirroring, but achievable in principle by other
+    means (e.g.\ a shared broadcast segment, or brute-force sequence
+    guessing at a cost proportional to the window size).
+    \item \textbf{The target's TCP stack processes the embedded
+    header using the packet's actual direction semantics} -- i.e.\ ICMP
+    errors are delivered to, and matched against, the original sender
+    of the embedded packet. This governed which side (server vs.\
+    client) each attack had to impersonate, and was the single
+    correction required to the design report's original packet tables.
+    \item \textbf{For Attack 1 specifically}: the target application
+    either sets \texttt{IP\_RECVERR} (uncommon, e.g.\ specialized error
+    reporting) or the report separately evaluates that narrower case as
+    a positive control, since the attack does not succeed against a
+    typical established connection without it.
+    \item \textbf{For Attack 2 specifically}: the attacker must be able
+    to repeat the spray persistently against an undefended target,
+    since (regardless of which recovery mechanism eventually turns out
+    to govern it) a defended or self-healing target can undo a
+    single-shot attack given enough time.
+\end{enumerate}
+
+\section{Conclusion}
+
+Both attacks were successfully implemented and demonstrated the core
+mechanism described in the design report: a spoofed ICMP error,
+carrying a forged embedded header, can influence a real TCP connection's
+behavior without the attacker being on-path. Attack 2 (PMTU reduction)
+matched its design-time expectations closely once corrected for the
+in-window sequence constraint. Attack 1 (connection reset) required a
+larger correction: it does \emph{not} reliably work against a realistic
+target, and its true precondition (\texttt{IP\_RECVERR}) is narrower
+than the design report assumed -- a materially different, and arguably
+more interesting, result than a simple confirmation would have been.
+
+Of the two evaluated defenses, ingress filtering proved to be a
+complete and reliable countermeasure against both attacks, while the
+kernel self-healing mechanism the design report's Implementation Plan
+specified (\texttt{tcp\_mtu\_probing=2}) did not produce its expected
+effect under either of two tested hypotheses for why it should.
+Reporting this negative result, rather than only reporting successes,
+is treated in this report as itself a legitimate and important finding:
+not every plausible, textbook-named defense behaves as its name
+suggests once it is actually measured.
+
+\begin{thebibliography}{9}
+\bibitem{rfc792} J. Postel, \emph{Internet Control Message Protocol}, RFC~792, Sept.\ 1981.
+\bibitem{rfc1122} R. Braden (Ed.), \emph{Requirements for Internet Hosts --- Communication Layers}, RFC~1122, Oct.\ 1989.
+\bibitem{rfc1191} J. Mogul and S. Deering, \emph{Path MTU Discovery}, RFC~1191, Nov.\ 1990.
+\bibitem{watson2004} P. Watson, \emph{Slipping in the Window: TCP Reset Attacks}, CanSecWest, 2004.
+\bibitem{rfc5961} A. Ramaiah, R. Stewart, M. Dalal, \emph{Improving TCP's Robustness to Blind In-Window Attacks}, RFC~5961, Aug.\ 2010.
+\bibitem{rfc2827} P. Ferguson and D. Senie, \emph{Network Ingress Filtering: Defeating Denial of Service Attacks which employ IP Source Address Spoofing}, BCP~38 / RFC~2827, May 2000.
+\bibitem{rfc6633} F. Gont, \emph{Deprecation of ICMP Source Quench Messages}, RFC~6633, May 2012.
+\end{thebibliography}
+
+\end{document}
