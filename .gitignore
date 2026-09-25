@@ -1,5 +1,9 @@
 # VM_COMMANDS.md
 # *.md
+.DS_Store
+Icon?
+._*
+.Trashes
 
 # Regenerable experiment output (pcaps, iperf3 json) — rerun the scripts to reproduce
 experiments/results/
